@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      position: relative;
+    }
+    #screen-wrap {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #screen {
+      height: 100vh;
+      width: calc(100vh * (256 / 240));
+      max-width: 100vw;
+      object-fit: contain;
+      image-rendering: pixelated;
+      display: block;
+      outline: none;
+    }
+    #debug {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #00ff00;
+      font-family: monospace;
+      font-size: 13px;
+      z-index: 1000;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="debug">Listo con audio. ¡Presiona ENTER o X!</div>
+  <div id="screen-wrap">
+    <canvas id="screen" width="256" height="240"></canvas>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jsnes/0.1.0/jsnes.min.js"></script>
+  <script>
+    (function() {
+      var fs = require('fs');
+      var path = require('path');
+      var canvas = document.getElementById('screen');
+      var debug = document.getElementById('debug');
+      var ctx = canvas.getContext('2d');
+      var imageData = ctx.createImageData(256, 240);
+      var buf = new ArrayBuffer(imageData.data.length);
+      var buf8 = new Uint8ClampedArray(buf);
+      var buf32 = new Uint32Array(buf);
+
+      for (var i = 0; i < buf32.length; ++i) buf32[i] = 0xFF000000;
+
+      var baseDir = path.dirname(process.mainModule.filename);
+      var romPath = path.join(baseDir, 'emulator', 'mariones.nes');
+
+      if (!fs.existsSync(romPath)) {
+        alert("No se encontró la ROM: " + romPath);
+        return;
+      }
+
+      var romBinary = fs.readFileSync(romPath, 'binary');
+
+      // --- CONFIGURACIÓN DE AUDIO (APU de NES) ---
+      var AudioCtx = window.AudioContext || window.webkitAudioContext;
+      var audioCtx = new AudioCtx();
+      var sampleRate = audioCtx.sampleRate;
+      var bufferSize = 2048;
+      var audioNode = audioCtx.createScriptProcessor(bufferSize, 0, 2);
+      var sampleQueue = [];
+
+      audioNode.onaudioprocess = function(e) {
+        var outL = e.outputBuffer.getChannelData(0);
+        var outR = e.outputBuffer.getChannelData(1);
+        for (var i = 0; i < bufferSize; i++) {
+          if (sampleQueue.length > 0) {
+            var s = sampleQueue.shift();
+            outL[i] = s[0];
+            outR[i] = s[1];
+          } else {
+            outL[i] = 0;
+            outR[i] = 0;
+          }
+        }
+      };
+      audioNode.connect(audioCtx.destination);
+
+      // --- INICIALIZACIÓN DEL NÚCLEO NES ---
+      var nes = new jsnes.NES({
+        onFrame: function(frameBuffer) {
+          var i = 0;
+          for (var y = 0; y < 240; ++y) {
+            for (var x = 0; x < 256; ++x) {
+              i = y * 256 + x;
+              buf32[i] = 0xFF000000 | frameBuffer[i];
+            }
+          }
+          imageData.data.set(buf8);
+          ctx.putImageData(imageData, 0, 0);
+        },
+        onAudioSample: function(left, right) {
+          if (sampleQueue.length < 8192) {
+            sampleQueue.push([left, right]);
+          }
+        },
+        sampleRate: sampleRate
+      });
+
+      nes.loadROM(romBinary);
+
+      // --- PUENTE DIRECTO AL REGISTRO $4016 (CONTROLES) ---
+      var botones = [0, 0, 0, 0, 0, 0, 0, 0];
+      var indiceLectura = 0;
+      var strobe = 0;
+
+      var mem = nes.mmap || (nes.cpu && nes.cpu.mmap) || (nes.opts && nes.opts.mmap);
+      if (mem) {
+        var origWrite = mem.write;
+        mem.write = function(addr, val) {
+          if (addr === 0x4016) {
+            if ((strobe & 1) === 1 && (val & 1) === 0) {
+              indiceLectura = 0;
+            }
+            strobe = val & 1;
+          }
+          return origWrite.call(mem, addr, val);
+        };
+
+        var origLoad = mem.load;
+        mem.load = function(addr) {
+          if (addr === 0x4016) {
+            var ret = 0x40;
+            if (strobe === 1) {
+              ret |= (botones[0] ? 1 : 0);
+            } else {
+              if (indiceLectura < 8) {
+                ret |= (botones[indiceLectura] ? 1 : 0);
+                indiceLectura++;
+              } else {
+                ret |= 1;
+              }
+            }
+            return ret;
+          }
+          return origLoad.call(mem, addr);
+        };
+      }
+
+      // --- BUCLE A 60 FPS ---
+      var fpsInterval = 1000 / 60;
+      var then = performance.now();
+
+      function loop(now) {
+        requestAnimationFrame(loop);
+        var elapsed = now - then;
+        if (elapsed > fpsInterval) {
+          then = now - (elapsed % fpsInterval);
+          nes.frame();
+        }
+      }
+      requestAnimationFrame(loop);
+
+      // --- ENTRADA DE TECLADO ---
+      var keyMap = {
+        38: 4, // Arriba
+        40: 5, // Abajo
+        37: 6, // Izquierda
+        39: 7, // Derecha
+        88: 0, // X -> A (Saltar)
+        90: 1, // Z -> B (Correr)
+        13: 3, // Enter -> Start
+        16: 2, // Shift -> Select
+        32: 0  // Espacio -> A
+      };
+
+      function setKey(keyCode, down) {
+        // Chromium requiere reactivar el AudioContext si arranca suspendido
+        if (audioCtx.state === 'suspended') {
+          audioCtx.resume();
+        }
+
+        if (keyMap[keyCode] !== undefined) {
+          var btn = keyMap[keyCode];
+          botones[btn] = down ? 1 : 0;
+          debug.innerText = (down ? "PULSANDO: " : "SUELTO: ") + "Btn " + btn;
+        }
+      }
+
+      window.enviarInput = setKey;
+
+      var target = (window.top && window.top !== window) ? window.top : window;
+      target.addEventListener('keydown', function(e) { setKey(e.keyCode, true); }, true);
+      target.addEventListener('keyup', function(e) { setKey(e.keyCode, false); }, true);
+
+      window.addEventListener('keydown', function(e) { setKey(e.keyCode, true); }, true);
+      window.addEventListener('keyup', function(e) { setKey(e.keyCode, false); }, true);
+    })();
+  </script>
+</body>
+</html>
